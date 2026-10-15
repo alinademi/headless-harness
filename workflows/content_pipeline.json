@@ -1,0 +1,28 @@
+{
+  "name": "Generalist research-to-content",
+  "steps": [
+    {
+      "id": "research",
+      "prompt": "Act as a research analyst. Investigate the goal, distinguish verifiable evidence from assumptions, and include links to sources when available. Explicitly flag any information you cannot verify.",
+      "mode": "read-only"
+    },
+    {
+      "id": "strategize",
+      "depends_on": ["research"],
+      "prompt": "Act as a strategist. Based on the research, identify the highest-value angle, audience, and three concrete takeaways. Identify unsupported claims.",
+      "mode": "read-only"
+    },
+    {
+      "id": "draft",
+      "depends_on": ["research", "strategize"],
+      "prompt": "Act as a content creator. Produce a LinkedIn post of at most 220 words based on the approved facts, with a concise hook and no invented statistics.",
+      "mode": "read-only"
+    },
+    {
+      "id": "review",
+      "depends_on": ["research", "draft"],
+      "prompt": "Act as a factual editor. Review and produce a revised, publish-ready post. Remove unsupported assertions and report any unresolved factual uncertainty. Do not publish or send it.",
+      "mode": "read-only"
+    }
+  ]
+}

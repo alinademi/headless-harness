@@ -1,0 +1,29 @@
+name: Headless harness
+on:
+  workflow_dispatch:
+    inputs:
+      goal:
+        description: Research goal
+        type: string
+        required: true
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install -g @openai/codex
+      - name: Run pipeline
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOAL: ${{ inputs.goal }}
+        run: node src/harness.ts run workflows/content_pipeline.json --provider codex --goal "$GOAL"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harness-state
+          path: .harness/
+          retention-days: 7
