@@ -16,14 +16,16 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 const prompt = fs.readFileSync(0, 'utf8');
 const text = prompt.startsWith('Extract only durable') ? '["Always cite the original source"]' : 'Mock answer: ' + prompt.split('YOUR STEP (').pop().split(')')[0];
-if (process.env.FAIL_FAKE === '1') { console.log(JSON.stringify({type:'turn.failed'})); process.exit(0); }
+if (process.env.FAIL_FAKE === '1' || prompt.includes('FAIL_STEP')) { console.log(JSON.stringify({type:'turn.failed'})); process.exit(0); }
+fs.writeFileSync('agent-env.json', JSON.stringify({codexHome:process.env.CODEX_HOME, github:process.env.GH_TOKEN, openai:process.env.OPENAI_API_KEY}));
 fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], text);
 console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text}}));
 console.log(JSON.stringify({type:'turn.completed'}));
 `);
   chmodSync(fake, 0o755);
   const state = join(dir, 'state');
-  const env = { ...process.env, HARNESS_HOME: state, PATH: bin + ':' + process.env.PATH };
+  const env = { ...process.env, HARNESS_HOME: state, PATH: bin + ':' + process.env.PATH,
+    OPENAI_API_KEY: 'test-key', GH_TOKEN: 'must-never-reach-agent' };
   const run = (args: string[], extraEnv: Record<string, string> = {}) => spawnSync(process.execPath,
     [...(Number(process.versions.node.split('.')[0]) < 24 ? ['--experimental-strip-types'] : []), script, ...args],
     { env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 15000 });
@@ -137,5 +139,49 @@ test('dream proposals are not saved as memory until promoted', () => {
     const db2 = ctx.sql();
     try { assert.equal((db2.prepare('SELECT count(*) AS n FROM memories').get() as {n:number}).n, 1); }
     finally { db2.close(); }
+  } finally { ctx.clean(); }
+});
+
+test('Codex receives a fresh config home and no unrelated credentials', () => {
+  const ctx = setup();
+  try {
+    const wf = ctx.workflow([{ id: 'research', prompt: 'Research' }]);
+    const r = ctx.run(['run', wf, '--goal', 'Goal']);
+    assert.equal(r.status, 0, r.stderr);
+    const id = submitted(r);
+    const seen = JSON.parse(readFileSync(join(ctx.state, 'jobs', id, 'workspace', 'agent-env.json'), 'utf8'));
+    assert.equal(seen.codexHome, join(ctx.state, 'jobs', id, 'codex-home'));
+    assert.equal(seen.openai, 'test-key');
+    assert.equal(seen.github, undefined);
+  } finally { ctx.clean(); }
+});
+
+test('MCP tools require approval, and Codex cannot accept unscoped MCP tools', () => {
+  const ctx = setup();
+  try {
+    let wf = ctx.workflow([{ id: 'a', prompt: 'Send', allowed_tools: ['mcp__crm__send'] }]);
+    let r = ctx.run(['submit', wf, '--provider', 'claude', '--goal', 'Goal']);
+    assert.notEqual(r.status, 0); assert.match(r.stderr, /require human approval/);
+    wf = ctx.workflow([{ id: 'a', prompt: 'Send', allowed_tools: ['Bash'], approval: true }]);
+    r = ctx.run(['submit', wf, '--provider', 'claude', '--goal', 'Goal']);
+    assert.notEqual(r.status, 0); assert.match(r.stderr, /Only explicit MCP tools/);
+    wf = ctx.workflow([{ id: 'a', prompt: 'Send', allowed_tools: ['mcp__crm__send'], approval: true }]);
+    r = ctx.run(['submit', wf, '--provider', 'codex', '--goal', 'Goal']);
+    assert.notEqual(r.status, 0); assert.match(r.stderr, /not enforceable/);
+  } finally { ctx.clean(); }
+});
+
+test('approved steps are never replayed automatically, even in read-only mode', () => {
+  const ctx = setup();
+  try {
+    const wf = ctx.workflow([{ id: 'a', prompt: 'FAIL_STEP', approval: true }]);
+    const id = submitted(ctx.run(['run', wf, '--goal', 'Goal']));
+    let r = ctx.run(['approve', id, 'a']); assert.equal(r.status, 0, r.stderr);
+    r = ctx.run(['worker']); assert.equal(r.status, 0, r.stderr);
+    const db = ctx.sql();
+    try {
+      assert.deepEqual({ ...db.prepare('SELECT state,attempts FROM steps').get() },
+        {state:'failed', attempts:1});
+    } finally { db.close(); }
   } finally { ctx.clean(); }
 });
