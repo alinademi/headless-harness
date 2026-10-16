@@ -68,8 +68,10 @@ function validate(input: unknown): Workflow {
     if (s.approval !== undefined && typeof s.approval !== 'boolean') throw Error(`Invalid approval: ${s.id}`);
     if (s.depends_on !== undefined && (!Array.isArray(s.depends_on) || s.depends_on.some(x => typeof x !== 'string')))
       throw Error(`Invalid dependencies: ${s.id}`);
-    if (s.allowed_tools !== undefined && (!Array.isArray(s.allowed_tools) || s.allowed_tools.some(x => typeof x !== 'string' || !/^[a-zA-Z0-9_.*:-]+$/.test(x))))
-      throw Error(`Invalid allowed_tools: ${s.id}`);
+    if (s.allowed_tools !== undefined && (!Array.isArray(s.allowed_tools) || s.allowed_tools.some(x => typeof x !== 'string' || !/^mcp__[a-zA-Z0-9_-]+__[a-zA-Z0-9_.*-]+$/.test(x))))
+      throw Error(`Only explicit MCP tools are supported in allowed_tools: ${s.id}`);
+    if (s.allowed_tools?.length && s.approval !== true)
+      throw Error(`MCP tools require human approval: ${s.id}`);
     if (s.timeout_seconds !== undefined && (!Number.isInteger(s.timeout_seconds) || s.timeout_seconds < 10 || s.timeout_seconds > 14400))
       throw Error(`Invalid timeout_seconds: ${s.id}`);
   }
@@ -92,6 +94,8 @@ function submit(db: DB, input: unknown, provider: string, goal: string) {
   if (provider !== 'codex' && provider !== 'claude') throw Error('Provider must be codex or claude');
   if (!goal?.trim()) throw Error('Goal is required');
   const spec = validate(input), id = randomUUID().replaceAll('-', '').slice(0, 12);
+  if (provider === 'codex' && spec.steps.some(s => s.allowed_tools?.length))
+    throw Error('Codex MCP tool allowlists are not enforceable; use Claude for approved MCP steps');
   db.exec('BEGIN IMMEDIATE');
   try {
     db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)').run(id, spec.name!, provider, JSON.stringify(spec), goal, 'queued', Date.now());
@@ -127,8 +131,9 @@ function command(provider: Provider, step: Step, last: string): [string, string[
     '--ask-for-approval', 'never', '--skip-git-repo-check', '--output-last-message', last, '-']];
   const baseTools = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
   if (mode === 'workspace-write') baseTools.push('Write', 'Edit');
+  const permitted = [...baseTools, ...(step.allowed_tools || [])];
   return ['claude', ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk',
-    '--tools', baseTools.join(','), '--allowedTools', ...baseTools, ...(step.allowed_tools || []),
+    '--tools', permitted.join(','), '--allowedTools', ...permitted,
     '--max-turns', '20', '--strict-mcp-config', '--mcp-config', join(ROOT, 'mcp.json')]];
 }
 function jsonEvents(file: string): Json[] {
@@ -143,11 +148,21 @@ async function invoke(provider: Provider, step: Step, prompt: string, directory:
   writeFileSync(join(directory, 'prompt.txt'), prompt, { mode: 0o600 });
   rmSync(last, { force: true });
   const [exe, args] = command(provider, step, last);
+  // Pass only provider credentials. Ambient tokens (GitHub, cloud, CRM) must never reach an agent.
+  const names = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TMP', 'TEMP',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    ...(provider === 'codex' ? ['OPENAI_API_KEY'] : ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'])];
+  const env: NodeJS.ProcessEnv = Object.fromEntries(names.filter(n => process.env[n] !== undefined).map(n => [n, process.env[n]]));
+  if (provider === 'codex') {
+    if (!env.OPENAI_API_KEY) throw Error('Codex jobs require OPENAI_API_KEY; personal Codex login/config is not shared');
+    env.CODEX_HOME = join(dirname(cwd), 'codex-home');
+    privateDir(env.CODEX_HOME);
+  }
   const stdoutFd = openSync(stream, 'w', 0o600), stderrFd = openSync(stderr, 'w', 0o600);
   let code: number | null;
   try {
     code = await new Promise<number | null>((done, fail) => {
-      const child = spawn(exe, args, { cwd, stdio: ['pipe', stdoutFd, stderrFd], detached: true });
+      const child = spawn(exe, args, { cwd, env, stdio: ['pipe', stdoutFd, stderrFd], detached: true });
       let timedOut = false, interrupted = false;
       const kill = () => { try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already exited */ } };
       const onInterrupt = () => { interrupted = true; kill(); process.exitCode = 130; };
@@ -155,7 +170,11 @@ async function invoke(provider: Provider, step: Step, prompt: string, directory:
       process.once('SIGINT', onInterrupt); process.once('SIGTERM', onInterrupt);
       child.stdin!.on('error', () => {}); // A CLI can exit before consuming stdin.
       child.stdin!.end(prompt);
-      child.once('error', fail);
+      child.once('error', error => {
+        clearTimeout(timeout);
+        process.off('SIGINT', onInterrupt); process.off('SIGTERM', onInterrupt);
+        fail(error);
+      });
       child.once('close', exitCode => {
         clearTimeout(timeout);
         process.off('SIGINT', onInterrupt); process.off('SIGTERM', onInterrupt);
@@ -224,7 +243,7 @@ async function advance(db: DB, id: string): Promise<string> {
     }
     const outputs = Object.fromEntries((step.depends_on || []).map(dep => [dep, rows.get(dep)?.output || '']));
     const prompt = buildPrompt(db, job, step, outputs);
-    const attempts = step.mode === 'workspace-write' ? 1 : 2;
+    const attempts = step.approval || step.mode === 'workspace-write' || step.allowed_tools?.length ? 1 : 2;
     for (let retry = 0; retry < attempts; retry++) {
       const count = (db.prepare('SELECT attempts FROM steps WHERE job_id=? AND id=?').get(id, step.id) as { attempts: number }).attempts + 1;
       db.prepare("UPDATE steps SET state='running',attempts=?,error=NULL WHERE job_id=? AND id=?").run(count, id, step.id);
