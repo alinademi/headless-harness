@@ -1,0 +1,7 @@
+{
+  "name": "Draft then operator-approved workspace action",
+  "steps": [
+    {"id":"plan", "prompt":"Create a short, practical checklist for achieving the goal. No external actions.","mode":"read-only"},
+    {"id":"write", "depends_on":["plan"], "prompt":"After the human approval gate, save the checklist as checklist.md in the current workspace. Do not send, email, publish, or change external services.", "mode":"workspace-write", "approval":true}
+  ]
+}
