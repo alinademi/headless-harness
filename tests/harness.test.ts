@@ -113,8 +113,8 @@ test('crash marks uncertain; retry requires fresh approval', () => {
 test('provider failure event blocks after bounded retries', () => {
   const ctx = setup();
   try {
-    const wf = ctx.workflow([{ id: 'research', prompt: 'Research' }]);
-    const r = ctx.run(['run', wf, '--goal', 'Goal'], { FAIL_FAKE: '1' });
+    const wf = ctx.workflow([{ id: 'research', prompt: 'FAIL_STEP' }]);
+    const r = ctx.run(['run', wf, '--goal', 'Goal']);
     const id = submitted(r);
     assert.notEqual(r.status, 0);
     assert.match(r.stdout, /blocked/);
